@@ -26,7 +26,7 @@ class Block:
 
     def calculate_hash(self):
         sha256 = hashlib.sha256()
-        sha256.update(f"{self.index}{self.prev_hash}{self.data}{self.valid_hash}{self.timestamp}.encode(utf-8"))
+        sha256.update(f"{self.index}{self.prev_hash}{self.data}{self.valid_hash}{self.timestamp}.encode("utf-8"))
         return sha256.hexdigest()
 
     def to_dict(self):
