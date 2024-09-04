@@ -1,5 +1,6 @@
 import sqlite3
 import sys
+import signal
 import argparse
 import requests
 from passlib.hash import argon2
@@ -8,10 +9,13 @@ import json
 
 
 # Create the parser
-parser = argparse.ArgumentParser(description="Your script description")
+parser = argparse.ArgumentParser(description="XenBLOCKs node synchronizer")
 
 # Add Ethereum address argument
 parser.add_argument("ethereum_address", type=str, help="Your Ethereum address")
+
+# Add verify argument
+parser.add_argument("--verify", action="store_true", help="Enable argon2 verification")
 
 # Parse the arguments
 args = parser.parse_args()
@@ -20,7 +24,9 @@ args = parser.parse_args()
 global my_ethereum_address
 my_ethereum_address = args.ethereum_address
 
-
+# Set the verify flag as a global variable
+global verify_flag
+verify_flag = args.verify
 
 def hash_value(value):
     return hashlib.sha256(value.encode()).hexdigest()
@@ -39,10 +45,26 @@ def build_merkle_tree(elements, merkle_tree={}):
         new_elements.append(new_hash)
     return build_merkle_tree(new_elements, merkle_tree)
 
+def validate(): 
+    conn = sqlite3.connect('blockchain.db')
+    c = conn.cursor()
+    c.execute('SELECT id, id, block_hash FROM blockchain order by id desc limit 1')
+    row = c.fetchone()
+    if row:
+        total_count, last_block_id, last_block_hash = row
+        validation_data = {
+                "total_count": total_count,
+                "my_ethereum_address": my_ethereum_address,
+                "last_block_id": last_block_id,
+                "last_block_hash": last_block_hash
+                }
+        print (validation_data)
+        requests.post("http://xenblocks.io/validate", json=validation_data)
+    conn.close()
 
 def get_total_blocks():
     # Send a GET request to retrieve the JSON response
-    url = "http://xenminer.mooo.com/total_blocks"
+    url = "http://xenblocks.io:4447/total_blocks"
     response = requests.get(url)
 
     # Check if the request was successful
@@ -50,7 +72,7 @@ def get_total_blocks():
         try:
             # Parse the JSON response
             data = json.loads(response.text)
-            total_blocks_top100 = data.get("total_blocks_top100", 0)
+            total_blocks_top100 = data.get("total_blocks", 0)
 
             # Subtract 100 and divide by 100 without remainder
             adjusted_value = (total_blocks_top100 - 100) // 100
@@ -62,7 +84,75 @@ def get_total_blocks():
 
     return None
 
+def verify_block_hashes():
+    conn = sqlite3.connect('blockchain.db')
+    c = conn.cursor()
+    c.execute('SELECT id, timestamp, prev_hash, merkle_root, block_hash, records_json FROM blockchain ORDER BY id')
+
+    prev_hash = 'genesis'  # Initialize with genesis hash
+    for row in c.fetchall():
+        id, timestamp, prev_hash_db, merkle_root, block_hash, records_json = row
+
+        # Verify block hash
+        block_contents = str(prev_hash) + str(merkle_root)
+        computed_block_hash = hash_value(block_contents)
+        if computed_block_hash != block_hash:
+            print(f"Block {id} is invalid. Computed hash doesn't match the stored hash.")
+            return False
+
+        # Verify Merkle root and Argon2 hashes
+        records = json.loads(records_json)
+        if len(records) < 100:
+            print ("Blockchain is corrupted at block {id}")
+            return False
+        verified_hashes = []
+        for record in records:
+            hash_to_verify = record.get("hash_to_verify")
+            #records_block_id = record.get('block_id')
+            records_block_id = record.get('xuni_id') if 'xuni_id' in record else record.get('block_id')
+            key = record.get("key")
+            account = record.get("account")
+
+            if verify_flag:
+                if argon2.verify(key, hash_to_verify):
+                    verified_hashes.append(hash_value(str(records_block_id) + hash_to_verify + key + account))
+                else:
+                    print ("Key and hash_to_verify fail argon2 verification ", key, hash_to_verify)
+                    return False
+            else:
+                verified_hashes.append(hash_value(str(records_block_id) + hash_to_verify + key + account))
+
+
+
+        if verified_hashes:
+            computed_merkle_root, _ = build_merkle_tree(verified_hashes)
+            if computed_merkle_root != merkle_root:
+                print(f"Block {id} is invalid. Computed Merkle root doesn't match the stored Merkle root.")
+                return False
+            else:
+                print (f"Block {id} is valid. Computed Merkle root match the stored Merkle root.")
+
+        # Set prev_hash for the next iteration
+        prev_hash = block_hash
+
+    print("All blocks are valid.")
+
+
+    return True
+
 conn = sqlite3.connect('blockchain.db')
+
+# Ctrl+C handler, saves the blockchain before exiting
+def signal_handler(sig, frame):
+    print('You pressed Ctrl+C!')
+    conn.close()
+    verify_block_hashes()
+    validate()
+    sys.exit(0)
+
+# initialize the signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
 c = conn.cursor()
 
 # Create blockchain table
@@ -81,6 +171,8 @@ print ("Last fetched block ID from blockchain: ", last_block_id)
 
 # Get the total blocks from the API
 total_blocks = get_total_blocks()
+#total_blocks = 1310951
+print ("Total blocks from mempool: ", last_block_id)
 if total_blocks is None:
     print("Failed to retrieve total_blocks.")
 else:
@@ -101,106 +193,70 @@ row = c.fetchone()
 prev_hash = row[0] if row else 'genesis'
 print ("Found previous record in blockchain, continuing with hash: ", prev_hash)
 
+
+# Initialize a counter to keep track of how many blocks have been processed
+counter = 0
+
 # Loop through block IDs starting from the last fetched ID
 for block_id in range(last_block_id + 1, end_block_id + 1):
-    url = f"http://xenminer.mooo.com:4445/getblocks/{block_id}"
-    #print ("Fetching URL: ", url)
+#Unittest
+#for block_id in range(last_block_id + 1, 15):
+
+    #url = f"http://xenminer.mooo.com:4445/getblocks/all/{block_id}"
+    url = f"http://xenblocks.io:4447/getallblocks2/{block_id}"
     response = requests.get(url)
+    
     if response.status_code == 200:
         records = json.loads(response.text)
+        
         # Check if the number of records is less than 100
         if len(records) < 100:
             print("All sealed blocks are current")
-            sys.exit()
+            break
+            
         verified_hashes = []
-        #print ("Fetching block_id ", block_id);
+        
         for record in records:
-            hash_to_verify = record.get("hash_to_verify")
-            key = record.get("key")
-            account = record.get("account")
+            records_block_id = record.get('xuni_id') if 'xuni_id' in record else record.get('block_id')
+            hash_to_verify = record.get('hash_to_verify')
+            key = record.get('key')
+            account = record.get('account')
 
-            if argon2.verify(key, hash_to_verify):
-                #print ("Argon2 verified for block_id", block_id);
-                verified_hashes.append(hash_value(str(block_id) + hash_to_verify + key + account))
+            if verify_flag:
+                if argon2.verify(key, hash_to_verify):
+                    verified_hashes.append(hash_value(str(records_block_id) + hash_to_verify + key + account))
+                else:
+                    print ("Key and hash_to_verify fail argon2 verification ", key, hash_to_verify)
+                    exit(0)
+            else:
+                verified_hashes.append(hash_value(str(records_block_id) + hash_to_verify + key + account))
 
+        
         if verified_hashes:  # Only insert if there are verified hashes
             merkle_root, _ = build_merkle_tree(verified_hashes)
             records_json_blob = json.dumps(records)
-
+            
             # Generate block hash using timestamp, prev_hash, and merkle_root
             block_contents = str(prev_hash) + str(merkle_root)
             block_hash = hash_value(block_contents)
-
+            
             # Insert new block into the blockchain table
-            c.execute('INSERT INTO blockchain (id, prev_hash, merkle_root, records_json, block_hash) VALUES (?,?, ?, ?, ?)',
+            c.execute('REPLACE INTO blockchain (id, prev_hash, merkle_root, records_json, block_hash) VALUES (?,?, ?, ?, ?)',
                       (block_id, prev_hash, merkle_root, records_json_blob, block_hash))
-            print ("Fetched block with merkleroot ", block_id, merkle_root)
-            conn.commit()
-
+            print(f"Fetched block with merkleroot {block_id}, {merkle_root}")
+            
             # Set prev_hash for the next iteration
             prev_hash = block_hash
+            
+            # Increment the counter
+            counter += 1
+            conn.commit()
 
-c.execute('SELECT id, id, block_hash FROM blockchain order by id desc limit 1')
-row = c.fetchone()
-if row:
-    total_count, last_block_id, last_block_hash = row
-    validation_data = {
-            "total_count": total_count,
-            "my_ethereum_address": my_ethereum_address,
-            "last_block_id": last_block_id,
-            "last_block_hash": last_block_hash
-            }
-    print (validation_data)
-    requests.post("http://xenminer.mooo.com/validate", json=validation_data)
-
+                
+# Commit any remaining blocks that were not committed inside the loop
+conn.commit()
 conn.close()
-
-def verify_block_hashes():
-    conn = sqlite3.connect('blockchain.db')
-    c = conn.cursor()
-    c.execute('SELECT id, timestamp, prev_hash, merkle_root, block_hash, records_json FROM blockchain ORDER BY id')
-
-    prev_hash = 'genesis'  # Initialize with genesis hash
-    for row in c.fetchall():
-        id, timestamp, prev_hash_db, merkle_root, block_hash, records_json = row
-
-        # Verify block hash
-        block_contents = str(prev_hash) + str(merkle_root)
-        computed_block_hash = hash_value(block_contents)
-        if computed_block_hash != block_hash:
-            print(f"Block {id} is invalid. Computed hash doesn't match the stored hash.")
-            return False
-
-        # Verify Merkle root and Argon2 hashes
-        records = json.loads(records_json)
-        verified_hashes = []
-        for record in records:
-            hash_to_verify = record.get("hash_to_verify")
-            key = record.get("key")
-            account = record.get("account")
-
-            if argon2.verify(key, hash_to_verify):
-                verified_hashes.append(hash_value(str(id) + hash_to_verify + key + account))
-                #print ("Key and hash_to_verify pass argon2 verification ", key, hash_to_verify)
-            else:
-                print ("Key and hash_to_verify fail argon2 verification ", key, hash_to_verify)
-                return False;
-
-        if verified_hashes:
-            computed_merkle_root, _ = build_merkle_tree(verified_hashes)
-            if computed_merkle_root != merkle_root:
-                print(f"Block {id} is invalid. Computed Merkle root doesn't match the stored Merkle root.")
-                return False
-            else:
-                print (f"Block {id} is valid. Computed Merkle root match the stored Merkle root.")
-
-        # Set prev_hash for the next iteration
-        prev_hash = block_hash
-
-    print("All blocks are valid.")
-
-
-    return True
 
 # Call verify_block_hashes after your existing code
 #verify_block_hashes()
+#validate()
